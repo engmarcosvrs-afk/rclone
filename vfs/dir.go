@@ -31,13 +31,14 @@ type Dir struct {
 	f            fs.Fs       // read only
 	cleanupTimer *time.Timer // read only: timer to call cacheCleanup
 
-	mu      sync.RWMutex // protects the following
-	parent  *Dir         // parent, nil for root
-	path    string
-	entry   fs.Directory
-	read    time.Time         // time directory entry last read
-	items   map[string]Node   // directory entries - can be empty but not nil
-	virtual map[string]vState // virtual directory entries - may be nil
+	mu       sync.RWMutex // protects the following
+	parent   *Dir         // parent, nil for root
+	path     string
+	entry    fs.Directory
+	read     time.Time         // time directory entry last read
+	items    map[string]Node   // directory entries - can be empty but not nil
+	virtual  map[string]vState // virtual directory entries - may be nil
+	snapshot bool              // set if the listing was loaded from a snapshot
 
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
@@ -726,6 +727,7 @@ func (mv manageVirtuals) end(d *Dir) {
 // set the last read time - must be called with the lock held
 func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time) error {
 	var err error
+	d.snapshot = false
 	mv := d._newManageVirtuals()
 	for _, entry := range entries {
 		name := path.Base(entry.Remote())
@@ -1050,6 +1052,9 @@ func (d *Dir) Create(name string, flags int) (*File, error) {
 	if err := d.checkName(name); err != nil {
 		return nil, err
 	}
+	if err := d.unSnapshot(); err != nil {
+		return nil, err
+	}
 	// Return existing node if one exists
 	node, err := d.stat(name)
 	switch err {
@@ -1086,6 +1091,9 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 		return nil, EROFS
 	}
 	if err := d.checkName(name); err != nil {
+		return nil, err
+	}
+	if err := d.unSnapshot(); err != nil {
 		return nil, err
 	}
 	path := path.Join(d.path, name)
@@ -1125,6 +1133,9 @@ func (d *Dir) Mkdir(name string) (*Dir, error) {
 func (d *Dir) Remove() error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
+	}
+	if err := d.unSnapshot(); err != nil {
+		return err
 	}
 	// Check directory is empty first
 	empty, err := d.isEmpty()
@@ -1191,6 +1202,9 @@ func (d *Dir) RemoveName(name string) error {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	if err := d.unSnapshot(); err != nil {
+		return err
+	}
 	// fs.Debugf(path, "Dir.Remove")
 	node, err := d.stat(name)
 	if err != nil {
@@ -1213,6 +1227,12 @@ func (d *Dir) Rename(oldName, newName string, destDir *Dir) error {
 		return EROFS
 	}
 	if err := destDir.checkName(newName); err != nil {
+		return err
+	}
+	if err := d.unSnapshot(); err != nil {
+		return err
+	}
+	if err := destDir.unSnapshot(); err != nil {
 		return err
 	}
 	oldPath := path.Join(d.path, oldName)

@@ -191,6 +191,7 @@ type VFS struct {
 	pollMu      sync.Mutex
 	pollChan    chan time.Duration
 	inUse       atomic.Int32 // count of number of opens
+	snapshotMu  sync.Mutex   // serialises writing the snapshot file
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
@@ -248,6 +249,11 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 	// Create root directory
 	vfs.root = newDir(vfs, f, nil, fsDir)
 
+	// Load the directory cache before anything can use it
+	if vfs.Opt.Snapshot != "" {
+		vfs.loadSnapshot()
+	}
+
 	// Start polling function
 	features := vfs.f.Features()
 	if do := features.ChangeNotify; do != nil {
@@ -294,7 +300,9 @@ func (vfs *VFS) refresh() {
 	err := vfs.root.readDirTree()
 	if err != nil {
 		fs.Errorf(vfs.f, "Error refreshing VFS directory cache: %v", err)
+		return
 	}
+	vfs.saveSnapshot()
 }
 
 // Reload VFS cache on SIGHUP
@@ -430,6 +438,8 @@ func (vfs *VFS) Shutdown() {
 		}
 	}
 	activeMu.Unlock()
+
+	vfs.saveSnapshot()
 
 	vfs.shutdownCache()
 

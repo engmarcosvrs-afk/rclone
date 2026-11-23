@@ -1,0 +1,68 @@
+---
+# Builds the Windows rclone.exe with the VFS snapshot used by Pendrive.bat
+
+name: pendrive
+
+on:
+  push:
+    branches:
+      - pendrive-snapshot
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Vet
+        run: go vet ./vfs/...
+
+      - name: Test snapshot
+        run: go test -v -run 'TestVFSSnapshot' ./vfs/
+
+      - name: Test vfs
+        run: go test ./vfs/...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: Build rclone.exe
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          VERSION="$(sed -n 's/^var VersionTag = "\(.*\)"/\1/p' fs/versiontag.go)-pendrive.${GITHUB_RUN_NUMBER}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir out
+          go build -trimpath -tags cmount -ldflags "-s -X github.com/rclone/rclone/fs.Version=$VERSION" -o out/rclone.exe .
+          cd out
+          zip -9 "rclone-$VERSION-windows-amd64.zip" rclone.exe
+          sha256sum "rclone-$VERSION-windows-amd64.zip" > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "rclone $VERSION (Pendrive)" \
+            --notes "rclone with --vfs-snapshot, built from branch pendrive-snapshot ($GITHUB_SHA)." \
+            out/rclone-*-windows-amd64.zip out/SHA256SUMS

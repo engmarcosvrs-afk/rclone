@@ -36,6 +36,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Refreshes the directory cache recursively in the background on start",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_snapshot",
+	Default: "",
+	Help:    "File to load the directory cache from on start and save it to after a full refresh and on exit",
+	Groups:  "VFS",
+}, {
 	Name:    "poll_interval",
 	Default: fs.Duration(time.Minute),
 	Help:    "Time to wait between polling for changes, must be smaller than dir-cache-time and only on supported remotes (set 0 to disable)",
@@ -190,6 +195,7 @@ type Options struct {
 	NoModTime          bool          `config:"no_modtime"`     // don't read mod times for files
 	DirCacheTime       fs.Duration   `config:"dir_cache_time"` // how long to consider directory listing cache valid
 	Refresh            bool          `config:"vfs_refresh"`    // refreshes the directory listing recursively on start
+	Snapshot           string        `config:"vfs_snapshot"`   // file to load and save the directory cache
 	PollInterval       fs.Duration   `config:"poll_interval"`
 	Umask              FileMode      `config:"umask"`
 	UID                uint32        `config:"uid"`

@@ -133,6 +133,9 @@ func rcRefresh(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 			result[""] = err.Error()
 		} else {
 			result[""] = "OK"
+			if recursive {
+				vfs.saveSnapshot()
+			}
 		}
 	} else {
 		for k, v := range in {

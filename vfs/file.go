@@ -669,6 +669,9 @@ func (f *File) Remove() (err error) {
 	if d.vfs.Opt.ReadOnly {
 		return EROFS
 	}
+	if err = d.unSnapshot(); err != nil {
+		return err
+	}
 
 	// Remove the object from the cache
 	wasWriting := false
@@ -887,6 +890,11 @@ func (f *File) Open(flags int) (fd Handle, err error) {
 	f.mu.RLock()
 	d := f.d
 	f.mu.RUnlock()
+	if write {
+		if err = d.unSnapshot(); err != nil {
+			return nil, err
+		}
+	}
 	CacheMode := d.vfs.Opt.CacheMode
 	if CacheMode >= vfscommon.CacheModeMinimal && (d.vfs.cache.InUse(f.CachePath()) || d.vfs.cache.Exists(f.CachePath())) {
 		fd, err = f.openRW(flags)
