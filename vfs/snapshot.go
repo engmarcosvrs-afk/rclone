@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,12 +21,16 @@ import (
 )
 
 // snapshotVersion is the version of the snapshot file format
-const snapshotVersion = 1
+const snapshotVersion = 2
 
-// snapshotHeader is the first record in a snapshot file
+// snapshotHeader is the first record in a snapshot file.
+//
+// One snapshot file holds listings for a whole remote with paths from
+// the root of the remote, so VFSes rooted at different directories of
+// the same remote can share it.
 type snapshotHeader struct {
 	Version int    `json:"v"`
-	Fs      string `json:"fs"`
+	Remote  string `json:"remote"`
 }
 
 // snapshotEntry is a file or directory in a snapshot listing
@@ -41,6 +46,62 @@ type snapshotEntry struct {
 type snapshotListing struct {
 	Dir     string          `json:"p"`
 	Entries []snapshotEntry `json:"e"`
+}
+
+// snapshotPrefix returns the path of the root of f from the root of its remote
+func snapshotPrefix(f fs.Fs) string {
+	return strings.Trim(f.Root(), "/")
+}
+
+// relativeTo returns dir relative to prefix and whether dir is prefix
+// or inside it.
+func relativeTo(prefix, dir string) (string, bool) {
+	switch {
+	case prefix == "":
+		return dir, true
+	case dir == prefix:
+		return "", true
+	case strings.HasPrefix(dir, prefix+"/"):
+		return dir[len(prefix)+1:], true
+	}
+	return "", false
+}
+
+// forEachListing calls fn for each listing in the snapshot file for
+// the remote named remote.
+func forEachListing(name, remote string, fn func(*snapshotListing)) error {
+	in, err := os.Open(name)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = in.Close()
+	}()
+	gz, err := gzip.NewReader(in)
+	if err != nil {
+		return fmt.Errorf("snapshot %q: %w", name, err)
+	}
+	dec := json.NewDecoder(gz)
+	var header snapshotHeader
+	if err = dec.Decode(&header); err != nil {
+		return fmt.Errorf("snapshot %q: bad header: %w", name, err)
+	}
+	if header.Version != snapshotVersion {
+		return fmt.Errorf("snapshot %q: unsupported version %d", name, header.Version)
+	}
+	if header.Remote != remote {
+		return fmt.Errorf("snapshot %q is for remote %q not %q", name, header.Remote, remote)
+	}
+	for {
+		var listing snapshotListing
+		err = dec.Decode(&listing)
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("snapshot %q: %w", name, err)
+		}
+		fn(&listing)
+	}
 }
 
 // snapObject is an fs.Object read from a snapshot file.
@@ -219,45 +280,22 @@ func (vfs *VFS) loadSnapshot() {
 	fs.Infof(vfs.f, "Loaded VFS snapshot of %d directories in %v", dirs, time.Since(start))
 }
 
-// readSnapshot reads the snapshot file returning the directory tree
-// and the set of directories which were listed in it.
+// readSnapshot reads the listings under the root of f from the
+// snapshot file returning the directory tree and the set of
+// directories which were listed in it, both relative to the root of f.
 func readSnapshot(name string, f fs.Fs) (dt dirtree.DirTree, listed map[string]struct{}, err error) {
-	in, err := os.Open(name)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer func() {
-		_ = in.Close()
-	}()
-	gz, err := gzip.NewReader(in)
-	if err != nil {
-		return nil, nil, fmt.Errorf("snapshot %q: %w", name, err)
-	}
-	dec := json.NewDecoder(gz)
-	var header snapshotHeader
-	if err = dec.Decode(&header); err != nil {
-		return nil, nil, fmt.Errorf("snapshot %q: bad header: %w", name, err)
-	}
-	if header.Version != snapshotVersion {
-		return nil, nil, fmt.Errorf("snapshot %q: unsupported version %d", name, header.Version)
-	}
-	if header.Fs != fs.ConfigString(f) {
-		return nil, nil, fmt.Errorf("snapshot %q is for %q not %q", name, header.Fs, fs.ConfigString(f))
-	}
+	prefix := snapshotPrefix(f)
 	dt = dirtree.New()
 	listed = make(map[string]struct{})
-	for {
-		var listing snapshotListing
-		err = dec.Decode(&listing)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return nil, nil, fmt.Errorf("snapshot %q: %w", name, err)
+	err = forEachListing(name, f.Name(), func(listing *snapshotListing) {
+		dir, ok := relativeTo(prefix, listing.Dir)
+		if !ok {
+			return
 		}
-		listed[listing.Dir] = struct{}{}
+		listed[dir] = struct{}{}
 		entries := make(fs.DirEntries, 0, len(listing.Entries))
 		for _, e := range listing.Entries {
-			remote := path.Join(listing.Dir, e.Name)
+			remote := path.Join(dir, e.Name)
 			if e.Dir {
 				entries = append(entries, fs.NewDir(remote, e.ModTime))
 				continue
@@ -279,7 +317,10 @@ func readSnapshot(name string, f fs.Fs) (dt dirtree.DirTree, listed map[string]s
 			}
 			entries = append(entries, o)
 		}
-		dt[listing.Dir] = entries
+		dt[dir] = entries
+	})
+	if err != nil {
+		return nil, nil, err
 	}
 	return dt, listed, nil
 }
@@ -317,8 +358,23 @@ func (vfs *VFS) writeSnapshot(name string) (dirs int, err error) {
 	}()
 	gz := gzip.NewWriter(tmp)
 	enc := json.NewEncoder(gz)
-	if err = enc.Encode(snapshotHeader{Version: snapshotVersion, Fs: fs.ConfigString(vfs.f)}); err != nil {
+	remote := vfs.f.Name()
+	prefix := snapshotPrefix(vfs.f)
+	if err = enc.Encode(snapshotHeader{Version: snapshotVersion, Remote: remote}); err != nil {
 		return 0, err
+	}
+	// Keep the listings outside this VFS which other VFSes on the same
+	// remote may have saved. Those inside it are replaced below.
+	keepErr := forEachListing(name, remote, func(listing *snapshotListing) {
+		if _, inside := relativeTo(prefix, listing.Dir); !inside && err == nil {
+			err = enc.Encode(listing)
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	if keepErr != nil && !errors.Is(keepErr, os.ErrNotExist) {
+		fs.Infof(vfs.f, "Replacing VFS snapshot: %v", keepErr)
 	}
 	// Only record hashes which don't need reading the data to compute
 	var hashTypes []hash.Type
@@ -329,7 +385,7 @@ func (vfs *VFS) writeSnapshot(name string) (dirs int, err error) {
 		if err != nil || d.read.IsZero() {
 			return
 		}
-		listing := snapshotListing{Dir: d.path, Entries: make([]snapshotEntry, 0, len(d.items))}
+		listing := snapshotListing{Dir: path.Join(prefix, d.path), Entries: make([]snapshotEntry, 0, len(d.items))}
 		for _, node := range d.items {
 			switch x := node.(type) {
 			case *Dir:
