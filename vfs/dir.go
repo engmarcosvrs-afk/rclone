@@ -31,14 +31,15 @@ type Dir struct {
 	f            fs.Fs       // read only
 	cleanupTimer *time.Timer // read only: timer to call cacheCleanup
 
-	mu       sync.RWMutex // protects the following
-	parent   *Dir         // parent, nil for root
-	path     string
-	entry    fs.Directory
-	read     time.Time         // time directory entry last read
-	items    map[string]Node   // directory entries - can be empty but not nil
-	virtual  map[string]vState // virtual directory entries - may be nil
-	snapshot bool              // set if the listing was loaded from a snapshot
+	mu         sync.RWMutex // protects the following
+	parent     *Dir         // parent, nil for root
+	path       string
+	entry      fs.Directory
+	read       time.Time         // time directory entry last read
+	items      map[string]Node   // directory entries - can be empty but not nil
+	virtual    map[string]vState // virtual directory entries - may be nil
+	snapshot   bool              // set if the listing was loaded from a snapshot
+	unverified bool              // set if the snapshot listing may be out of date so a scan must re-read it
 
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
@@ -728,6 +729,7 @@ func (mv manageVirtuals) end(d *Dir) {
 func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree, when time.Time) error {
 	var err error
 	d.snapshot = false
+	d.unverified = false
 	mv := d._newManageVirtuals()
 	for _, entry := range entries {
 		name := path.Base(entry.Remote())

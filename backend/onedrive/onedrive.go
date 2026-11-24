@@ -3313,12 +3313,66 @@ func (f *Fs) canonicalDriveID(driveID string) (canonicalDriveID string) {
 // an object is changed. For instance, if a/b/c is changed, this function
 // will call notifyFunc with a, a/b and a/b/c.
 func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryType), pollIntervalChan <-chan time.Duration) {
+	f.ChangeNotifyResume(ctx, "", notifyFunc, nil, nil, pollIntervalChan)
+}
+
+// errDeltaGone is returned when the delta token can no longer be used
+var errDeltaGone = errors.New("delta token is no longer valid")
+
+// ChangeNotifyResume is like ChangeNotify but starts from the delta
+// token in state, delivering the changes made since it was issued.
+//
+// stateFunc is called with each new delta token and lostFunc if the
+// token in state has expired.
+func (f *Fs) ChangeNotifyResume(ctx context.Context, state string, notifyFunc func(string, fs.EntryType), stateFunc func(string), lostFunc func(), pollIntervalChan <-chan time.Duration) {
 	go func() {
-		// get the StartPageToken early so all changes from now on get processed
-		nextDeltaToken, err := f.changeNotifyStartPageToken(ctx)
-		if err != nil {
-			fs.Errorf(f, "Could not get first deltaLink: %s", err)
-			return
+		nextDeltaToken := state
+		poll := func() {
+			newDeltaToken, err := f.changeNotifyRunner(ctx, notifyFunc, nextDeltaToken)
+			if errors.Is(err, errDeltaGone) {
+				fs.Infof(f, "Saved change position has expired so starting from now: %v", err)
+				newDeltaToken, err = f.changeNotifyStartPageToken(ctx)
+				if err != nil {
+					fs.Infof(f, "Change notify listener failure: %s", err)
+					return
+				}
+				nextDeltaToken = newDeltaToken
+				if lostFunc != nil {
+					lostFunc()
+				}
+				if stateFunc != nil {
+					stateFunc(nextDeltaToken)
+				}
+				return
+			}
+			if err != nil {
+				// Keep the token we already have: replacing it with the
+				// empty token from a failed poll would reset the delta
+				// listing to the start and lose every change in between.
+				fs.Infof(f, "Change notify listener failure: %s", err)
+				return
+			}
+			nextDeltaToken = newDeltaToken
+			if stateFunc != nil {
+				stateFunc(nextDeltaToken)
+			}
+		}
+
+		if nextDeltaToken == "" {
+			// get the StartPageToken early so all changes from now on get processed
+			var err error
+			nextDeltaToken, err = f.changeNotifyStartPageToken(ctx)
+			if err != nil {
+				fs.Errorf(f, "Could not get first deltaLink: %s", err)
+				return
+			}
+			if stateFunc != nil {
+				stateFunc(nextDeltaToken)
+			}
+		} else {
+			// Catch up with the changes since state without waiting for the first tick
+			fs.Debugf(f, "Resuming change notify from saved delta token")
+			poll()
 		}
 
 		fs.Debugf(f, "Next delta token is: %s", nextDeltaToken)
@@ -3344,16 +3398,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 				}
 			case <-tickerC:
 				fs.Debugf(f, "Checking for changes on remote")
-				var newDeltaToken string
-				newDeltaToken, err = f.changeNotifyRunner(ctx, notifyFunc, nextDeltaToken)
-				if err != nil {
-					// Keep the token we already have: replacing it with the
-					// empty token from a failed poll would reset the delta
-					// listing to the start and lose every change in between.
-					fs.Infof(f, "Change notify listener failure: %s", err)
-				} else {
-					nextDeltaToken = newDeltaToken
-				}
+				poll()
 			}
 		}
 	}()
@@ -3380,11 +3425,16 @@ func (f *Fs) changeNotifyStartPageToken(ctx context.Context) (nextDeltaToken str
 func (f *Fs) changeNotifyNextChange(ctx context.Context, token, nextLink string) (delta api.DeltaResponse, err error) {
 	opts := f.buildDriveDeltaOpts(token, nextLink)
 
+	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
-		var resp *http.Response
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &delta)
 		return shouldRetry(ctx, resp, err)
 	})
+	// An expired token is reported with 410 Gone and resyncRequired
+	// https://learn.microsoft.com/en-us/graph/api/driveitem-delta
+	if err != nil && ((resp != nil && resp.StatusCode == http.StatusGone) || strings.Contains(err.Error(), "resyncRequired")) {
+		err = fmt.Errorf("%w: %w", errDeltaGone, err)
+	}
 
 	return
 }
@@ -3518,26 +3568,27 @@ func withTrailingColon(remotePath string) string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs              = (*Fs)(nil)
-	_ fs.Purger          = (*Fs)(nil)
-	_ fs.Copier          = (*Fs)(nil)
-	_ fs.Mover           = (*Fs)(nil)
-	_ fs.DirMover        = (*Fs)(nil)
-	_ fs.DirCacheFlusher = (*Fs)(nil)
-	_ fs.Abouter         = (*Fs)(nil)
-	_ fs.PublicLinker    = (*Fs)(nil)
-	_ fs.CleanUpper      = (*Fs)(nil)
-	_ fs.ListRer         = (*Fs)(nil)
-	_ fs.ListPer         = (*Fs)(nil)
-	_ fs.Shutdowner      = (*Fs)(nil)
-	_ fs.Object          = (*Object)(nil)
-	_ fs.MimeTyper       = &Object{}
-	_ fs.IDer            = &Object{}
-	_ fs.Metadataer      = (*Object)(nil)
-	_ fs.Metadataer      = (*Directory)(nil)
-	_ fs.SetModTimer     = (*Directory)(nil)
-	_ fs.SetMetadataer   = (*Directory)(nil)
-	_ fs.MimeTyper       = &Directory{}
-	_ fs.DirSetModTimer  = (*Fs)(nil)
-	_ fs.MkdirMetadataer = (*Fs)(nil)
+	_ fs.Fs                  = (*Fs)(nil)
+	_ fs.Purger              = (*Fs)(nil)
+	_ fs.Copier              = (*Fs)(nil)
+	_ fs.Mover               = (*Fs)(nil)
+	_ fs.DirMover            = (*Fs)(nil)
+	_ fs.DirCacheFlusher     = (*Fs)(nil)
+	_ fs.Abouter             = (*Fs)(nil)
+	_ fs.PublicLinker        = (*Fs)(nil)
+	_ fs.CleanUpper          = (*Fs)(nil)
+	_ fs.ListRer             = (*Fs)(nil)
+	_ fs.ListPer             = (*Fs)(nil)
+	_ fs.Shutdowner          = (*Fs)(nil)
+	_ fs.Object              = (*Object)(nil)
+	_ fs.MimeTyper           = &Object{}
+	_ fs.IDer                = &Object{}
+	_ fs.Metadataer          = (*Object)(nil)
+	_ fs.ChangeNotifyResumer = (*Fs)(nil)
+	_ fs.Metadataer          = (*Directory)(nil)
+	_ fs.SetModTimer         = (*Directory)(nil)
+	_ fs.SetMetadataer       = (*Directory)(nil)
+	_ fs.MimeTyper           = &Directory{}
+	_ fs.DirSetModTimer      = (*Fs)(nil)
+	_ fs.MkdirMetadataer     = (*Fs)(nil)
 )

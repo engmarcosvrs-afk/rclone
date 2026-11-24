@@ -580,6 +580,22 @@ type ChangeNotifier interface {
 	ChangeNotify(context.Context, func(string, EntryType), <-chan time.Duration)
 }
 
+// ChangeNotifyResumer is an optional interface for Fs whose change
+// notifications can be resumed from a saved position, so that changes
+// made while nothing was listening are delivered too.
+type ChangeNotifyResumer interface {
+	// ChangeNotifyResume is like ChangeNotify but starts from the
+	// position in state, delivering the changes made since then.
+	//
+	// If state is "" it starts from the current position. If the
+	// remote can no longer resume from state it starts from the
+	// current position and calls lostFunc, if not nil.
+	//
+	// stateFunc, if not nil, is called with the new position once
+	// all the changes up to it have been passed to notifyFunc.
+	ChangeNotifyResume(ctx context.Context, state string, notifyFunc func(string, EntryType), stateFunc func(string), lostFunc func(), pollIntervalChan <-chan time.Duration)
+}
+
 // EntryType can be associated with remote paths to identify their type
 type EntryType int
 

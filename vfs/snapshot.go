@@ -21,7 +21,7 @@ import (
 )
 
 // snapshotVersion is the version of the snapshot file format
-const snapshotVersion = 2
+const snapshotVersion = 3
 
 // snapshotHeader is the first record in a snapshot file.
 //
@@ -33,7 +33,10 @@ type snapshotHeader struct {
 	Remote  string `json:"remote"`
 }
 
-// snapshotEntry is a file or directory in a snapshot listing
+// snapshotEntry is a file or directory in a snapshot listing.
+//
+// Size is the size of the directory and its contents for a directory
+// or -1 if that isn't known.
 type snapshotEntry struct {
 	Name    string            `json:"n"`
 	Dir     bool              `json:"d,omitempty"`
@@ -42,10 +45,16 @@ type snapshotEntry struct {
 	Hashes  map[string]string `json:"h,omitempty"`
 }
 
-// snapshotListing is the listing of one directory in a snapshot file
+// snapshotListing is the listing of one directory in a snapshot file.
+//
+// State is the change notify position the listing is up to date with
+// and StateTime when that position was reached, or "" if the listing
+// must be read again before it can be trusted.
 type snapshotListing struct {
-	Dir     string          `json:"p"`
-	Entries []snapshotEntry `json:"e"`
+	Dir       string          `json:"p"`
+	Entries   []snapshotEntry `json:"e"`
+	State     string          `json:"s,omitempty"`
+	StateTime int64           `json:"st,omitempty"`
 }
 
 // snapshotPrefix returns the path of the root of f from the root of its remote
@@ -248,15 +257,19 @@ func (d *Dir) unSnapshot() error {
 //
 // It must be called before the VFS is in use. Directories which were
 // not listed when the snapshot was saved are left to be read on demand.
-func (vfs *VFS) loadSnapshot() {
+//
+// If resumable is set the change notify position to resume from is
+// returned so the changes made since the snapshot can be applied, and
+// listings which are up to date with it don't need a scan.
+func (vfs *VFS) loadSnapshot(resumable bool) (state string) {
 	start := time.Now()
 	dt, listed, err := readSnapshot(vfs.Opt.Snapshot, vfs.f)
 	if errors.Is(err, os.ErrNotExist) {
 		fs.Infof(vfs.f, "No VFS snapshot found at %q", vfs.Opt.Snapshot)
-		return
+		return ""
 	} else if err != nil {
 		fs.Errorf(vfs.f, "Ignoring VFS snapshot: %v", err)
-		return
+		return ""
 	}
 	root := vfs.root
 	root.mu.Lock()
@@ -264,40 +277,77 @@ func (vfs *VFS) loadSnapshot() {
 	root.mu.Unlock()
 	if err != nil {
 		fs.Errorf(vfs.f, "Failed to load VFS snapshot: %v", err)
-		return
+		return ""
 	}
-	dirs := 0
+	// Resume from the oldest position so no change to any listing is missed
+	var stateTime int64
+	if resumable {
+		for _, l := range listed {
+			if l.State != "" && (stateTime == 0 || l.StateTime < stateTime) {
+				state, stateTime = l.State, l.StateTime
+			}
+		}
+	}
+	vfs.cnMu.Lock()
+	vfs.cnState, vfs.cnStateTime = state, stateTime
+	vfs.cnMu.Unlock()
+	dirs, unverified := 0, 0
 	root.walk(func(d *Dir) {
-		if _, ok := listed[d.path]; ok {
+		if l, ok := listed[d.path]; ok {
 			d.read = start
 			d.snapshot = true
+			d.unverified = state == "" || l.State == ""
+			if d.unverified {
+				unverified++
+			}
 			dirs++
 		} else {
 			// Not listed in the snapshot so read it from the remote when needed
 			d.read = time.Time{}
 		}
 	})
-	fs.Infof(vfs.f, "Loaded VFS snapshot of %d directories in %v", dirs, time.Since(start))
+	fs.Infof(vfs.f, "Loaded VFS snapshot of %d directories (%d to be verified) in %v", dirs, unverified, time.Since(start))
+	return state
+}
+
+// setChangeState records the change notify position the directory
+// cache is up to date with.
+func (vfs *VFS) setChangeState(state string) {
+	vfs.cnMu.Lock()
+	vfs.cnState, vfs.cnStateTime = state, time.Now().UnixNano()
+	vfs.cnMu.Unlock()
+}
+
+// changesLost marks the directories loaded from the snapshot as
+// needing to be read again because the changes since it was saved
+// can't be found out.
+func (vfs *VFS) changesLost() {
+	fs.Logf(vfs.f, "Changes since the VFS snapshot can't be found so it will be verified by the next scan")
+	vfs.root.walk(func(d *Dir) {
+		if d.snapshot {
+			d.unverified = true
+		}
+	})
 }
 
 // readSnapshot reads the listings under the root of f from the
 // snapshot file returning the directory tree and the set of
 // directories which were listed in it, both relative to the root of f.
-func readSnapshot(name string, f fs.Fs) (dt dirtree.DirTree, listed map[string]struct{}, err error) {
+func readSnapshot(name string, f fs.Fs) (dt dirtree.DirTree, listed map[string]snapshotListing, err error) {
 	prefix := snapshotPrefix(f)
 	dt = dirtree.New()
-	listed = make(map[string]struct{})
+	listed = make(map[string]snapshotListing)
 	err = forEachListing(name, f.Name(), func(listing *snapshotListing) {
 		dir, ok := relativeTo(prefix, listing.Dir)
 		if !ok {
 			return
 		}
-		listed[dir] = struct{}{}
+		listed[dir] = snapshotListing{State: listing.State, StateTime: listing.StateTime}
 		entries := make(fs.DirEntries, 0, len(listing.Entries))
 		for _, e := range listing.Entries {
 			remote := path.Join(dir, e.Name)
 			if e.Dir {
-				entries = append(entries, fs.NewDir(remote, e.ModTime))
+				entries = append(entries, fs.NewDir(remote, e.ModTime).SetSize(e.Size))
 				continue
 			}
 			o := &snapObject{
@@ -381,17 +431,24 @@ func (vfs *VFS) writeSnapshot(name string) (dirs int, err error) {
 	if !vfs.f.Features().SlowHash {
 		hashTypes = vfs.f.Hashes().Array()
 	}
+	vfs.cnMu.Lock()
+	state, stateTime := vfs.cnState, vfs.cnStateTime
+	vfs.cnMu.Unlock()
 	vfs.root.walk(func(d *Dir) {
 		if err != nil || d.read.IsZero() {
 			return
 		}
 		listing := snapshotListing{Dir: path.Join(prefix, d.path), Entries: make([]snapshotEntry, 0, len(d.items))}
+		if !d.unverified {
+			listing.State, listing.StateTime = state, stateTime
+		}
 		for _, node := range d.items {
 			switch x := node.(type) {
 			case *Dir:
 				listing.Entries = append(listing.Entries, snapshotEntry{
 					Name:    path.Base(x.path),
 					Dir:     true,
+					Size:    x.entrySize(),
 					ModTime: x.ModTime(),
 				})
 			case *File:

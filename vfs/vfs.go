@@ -192,6 +192,11 @@ type VFS struct {
 	pollChan    chan time.Duration
 	inUse       atomic.Int32 // count of number of opens
 	snapshotMu  sync.Mutex   // serialises writing the snapshot file
+	cnMu        sync.Mutex   // protects cnState and cnStateTime
+	cnState     string       // change notify position the directory cache is up to date with
+	cnStateTime int64        // when cnState was reached as unix nanoseconds
+	scanMu      sync.Mutex   // held while a scan is running
+	scanStats   scanStats    // progress of the last scan
 }
 
 // Keep track of active VFS keyed on fs.ConfigString(f)
@@ -249,14 +254,22 @@ func New(ctx context.Context, f fs.Fs, opt *vfscommon.Options) *VFS {
 	// Create root directory
 	vfs.root = newDir(vfs, f, nil, fsDir)
 
-	// Load the directory cache before anything can use it
+	// Load the directory cache before anything can use it, finding
+	// where to resume the change notifications from if possible
+	features := vfs.f.Features()
+	resumer, resumable := vfs.f.(fs.ChangeNotifyResumer)
+	resumable = resumable && features.ChangeNotify != nil && vfs.Opt.Snapshot != ""
+	var resumeState string
 	if vfs.Opt.Snapshot != "" {
-		vfs.loadSnapshot()
+		resumeState = vfs.loadSnapshot(resumable)
 	}
 
 	// Start polling function
-	features := vfs.f.Features()
-	if do := features.ChangeNotify; do != nil {
+	if resumable {
+		vfs.pollChan = make(chan time.Duration)
+		resumer.ChangeNotifyResume(vfs.ctx, resumeState, vfs.root.changeNotify, vfs.setChangeState, vfs.changesLost, vfs.pollChan)
+		vfs.pollChan <- time.Duration(vfs.Opt.PollInterval)
+	} else if do := features.ChangeNotify; do != nil {
 		vfs.pollChan = make(chan time.Duration)
 		do(vfs.ctx, vfs.root.changeNotify, vfs.pollChan)
 		vfs.pollChan <- time.Duration(vfs.Opt.PollInterval)

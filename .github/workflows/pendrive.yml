@@ -24,10 +24,13 @@ jobs:
           go-version: stable
 
       - name: Vet
-        run: go vet ./vfs/...
+        run: go vet ./vfs/... ./fs/ ./backend/onedrive/...
 
-      - name: Test snapshot
-        run: go test -v -run 'TestVFSSnapshot' ./vfs/
+      - name: Test snapshot and scan
+        run: go test -v -run 'TestVFSSnapshot|TestVFSScan' ./vfs/
+
+      - name: Test onedrive
+        run: go test ./backend/onedrive/...
 
       - name: Test vfs
         run: go test ./vfs/...
